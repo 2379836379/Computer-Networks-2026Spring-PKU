@@ -26,6 +26,7 @@ int prepare_DATA(char* from_email, char* to_email, char* subject, char* body, ch
  * the socket descriptor is stored in cfd
 **********************************************************************/
 int cfd;
+// 连接 SMTP 服务器，得到全局 socket cfd
 int establish_connection();
 int close_connection();
 
@@ -35,8 +36,7 @@ int send_email(char* account, char* password, char* from_email, char* to_email,
         char* subject, char* body, char* attachment_path);
 
 
-
-
+// 将数据转换为文本字符
 int to_base64(char* dst, char* src, int size){
     char *base64_table="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     int str_len=strlen(src);  
@@ -75,7 +75,7 @@ int to_base64(char* dst, char* src, int size){
     return 0;
 }
 
-
+// 把附件文件转成纯文本
 int uuencode(char* file_name, char* dst_buff){
     char cmd[50]="";
     sprintf(cmd, "uuencode %s %s > temp", file_name, file_name);
@@ -107,9 +107,17 @@ int establish_connection(){
     ************* start of your code *****************************************
     *************************************************************************/
     cfd = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
-
-    // other code
-
+    // 转换为IP
+    struct hostent* host = gethostbyname("smtphz.qiye.163.com");
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    // IPV4
+    addr.sin_family = AF_INET;
+    // 端口
+    addr.sin_port = htons(25);
+    // 地址
+    memcpy(&addr.sin_addr, host->h_addr_list[0], host->h_length);
+    connect(cfd, (struct sockaddr *)&addr, sizeof(addr));
     return 0;
     /*************************************************************************
     ************* end of your code *****************************************
@@ -125,10 +133,8 @@ int request_and_response(char* request, char* response){
     /*************************************************************************
     ************* start of your code *****************************************
     *************************************************************************/
-    cfd = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
-
-    // other code
-
+    send(cfd, request, strlen(request), 0);
+    recv(cfd, response, RECV_SIZE - 1, 0);
     return 0;
     /*************************************************************************
     ************* end of your code *****************************************
@@ -147,16 +153,34 @@ int prepare_DATA(char* from_email, char* to_email, char* subject, char* body, ch
     /*************************************************************************
     ************* start of your code *****************************************
     *************************************************************************/
+    // TO
+    sprintf(temp, "To:%s\r\n", from_email);
+    strcat(target_DATA, temp);
 
-    // other code
+    // SUBJECT
+    sprintf(temp, "Subject: %s\r\n", subject);
+    strcat(target_DATA, temp);
+
+    // 空行，表示邮件头结束，正文开始
+    strcat(target_DATA, "\r\n");
+
+    // BODY
+    sprintf(temp, "%s\r\n", body);
+    strcat(target_DATA, temp);
+
+    // ATTACHMENT
+    if (attach_file != NULL) {
+        uuencode(attach_file, temp);
+        strcat(target_DATA, "\r\n");
+        strcat(target_DATA, temp);
+        strcat(target_DATA, "\r\n");
+    }
 
     /*************************************************************************
     ************* end of your code *****************************************
     *************************************************************************/
-
-
-
     strcat(target_DATA, ".\r\n");
+    return 0;
 }
 
 
@@ -169,6 +193,7 @@ int send_email(char* username, char* password, char* from_email, char* to_email,
     establish_connection();
     
     char temp[100];
+    // send,receive buffer
     char rbuf[RECV_SIZE];
     char sbuf[SEND_SIZE];
 
@@ -186,23 +211,46 @@ int send_email(char* username, char* password, char* from_email, char* to_email,
     *************************************************************************/
 
 	// send AUTH 
+    sprintf(sbuf, "AUTH LOGIN\r\n");
+    request_and_response(sbuf, rbuf);
+
 	// send username (base64)
+    memset(temp, 0, sizeof(temp));
+    to_base64(temp, username, strlen(username));
+    strcat(temp, "\r\n");
+    request_and_response(temp, rbuf);
+
 	// send password (base64)
+    memset(temp, 0, sizeof(temp));
+    to_base64(temp, password, strlen(password));
+    strcat(temp, "\r\n");
+    request_and_response(temp, rbuf);
+
 	// send MAIL FROM
+    sprintf(sbuf, "MAIL FROM:<%s>\r\n", from_email);
+    request_and_response(sbuf, rbuf);
+
 	// send RCPT TO
+    sprintf(sbuf, "RCPT TO:<%s>\r\n", to_email);
+    request_and_response(sbuf, rbuf);
+
 	// send DATA
+    sprintf(sbuf, "DATA\r\n");
+    request_and_response(sbuf, rbuf);
+
 	// send email (this step is complex, do it in prepare_DATA()
+    memset(temp, 0, sizeof(temp));
+    prepare_DATA(from_email, to_email, subject, body, attachment_path, temp);
+    request_and_response(temp, rbuf);
+
 	// send QUIT
+    sprintf(sbuf, "QUIT\r\n");
+    request_and_response(sbuf, rbuf);
+    
     /*************************************************************************
     ************* end of your code *****************************************
     *************************************************************************/
-
-
-
-    
     // CLOSE TCP
-   
     close_connection();
-
     return 0;
 }
