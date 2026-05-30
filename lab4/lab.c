@@ -11,6 +11,10 @@
 #include <unistd.h>
 #include <netinet/in.h>
 
+#include <sys/types.h>   // 提供 u_char, u_short, u_int 等类型
+#include <pcap.h>        // 或者其他需要的头文件
+
+
 #define LOG 
 
 
@@ -136,10 +140,12 @@ int send_packet(net_device_t *dev, const uint8_t *data, uint32_t len) {
 void Hub() {
     common_init();
     while (1) {
+        // 上锁buffer
         pthread_mutex_lock(&pkt_buffer.lock);
         
         // Check if buffer is empty
         if (pkt_buffer.head == pkt_buffer.tail) {
+            // 解锁
             pthread_mutex_unlock(&pkt_buffer.lock);
             usleep(1000); // Sleep 1ms if buffer is empty
             continue;
@@ -154,7 +160,11 @@ void Hub() {
         /*************************************
          * start of your code
          *************************************/
-         
+        for (int i = 0; i < device_count; i++) {
+            if (&devices[i] != entry->device) {
+                send_packet(&devices[i], entry->data, entry->len);
+            }
+        }
         
         /*************************************
          * end of your code
@@ -172,6 +182,11 @@ void Hub() {
 
 void Switch(){
     common_init();
+    // 初始化交换机的转发表 fdb
+    // fdb 里存的是“MAC 地址 -> 所在设备”的映射
+    // fdb.entries[i].mac 存一个 MAC 地址
+    // fdb.entries[i].device 存这个 MAC 对应在哪个设备/端口上；记录的是设备名字符串
+    // fdb.count 表示当前已经记录了多少条映射
     memset(&fdb, 0, sizeof(fdb));  // Initialize forwarding database
 
     while (1) {
@@ -195,18 +210,58 @@ void Switch(){
          *************************************/
          
         // Get Ethernet header
-
+        // 获取 eth->src_mac/eth->dst_mac
+        // entry->data 里存的本来就是“抓到的原始以太网帧字节流”，
+        // 而以太网帧开头的前 14 字节正好就是 Ethernet header
+        eth_header_t *eth = (eth_header_t *)entry->data;
         
         // Learn source MAC address
-
+        int found_src = 0;
+        for (int i = 0; i < fdb.count; i++) {
+            if (memcmp(fdb.entries[i].mac, eth->src_mac, 6) == 0) {
+                // 更新源mac对应的设备
+                strncpy(fdb.entries[i].device, entry->device->name, 31);
+                fdb.entries[i].device[31] = '\0';
+                found_src = 1;
+                break;
+            }
+        }
+        if (!found_src && fdb.count < MAX_DEVICES) {
+            memcpy(fdb.entries[fdb.count].mac, eth->src_mac, 6);
+            strncpy(fdb.entries[fdb.count].device, entry->device->name, 31);
+            fdb.entries[fdb.count].device[31] = '\0';
+            fdb.count++;
+        }
         
         // Forward packet
-    
-            // case 1: Found destination, forward to that device
+        int found_dst = -1;
+        for (int i = 0; i < fdb.count; i++) {
+            if (memcmp(fdb.entries[i].mac, eth->dst_mac, 6) == 0) {
+                found_dst = i;
+                break;
+            }
+        }
 
+        // case 1: Found destination, forward to that device
+        if (found_dst != -1) {
+            for (int i = 0; i < device_count; i++) {
+                //当前这个 devices[i] 的名字是否等于转发表中记录的目标设备名
+                if (strcmp(devices[i].name, fdb.entries[found_dst].device) == 0 &&
+                    &devices[i] != entry->device) {
+                    send_packet(&devices[i], entry->data, entry->len);
+                    break;
+                }
+            }
+        }
                 
-            // case 2: Flood to all ports except ingress
-        
+        // case 2: Flood to all ports except ingress
+        else {
+            for (int i = 0; i < device_count; i++) {
+                if (&devices[i] != entry->device) {
+                    send_packet(&devices[i], entry->data, entry->len);
+                }
+            }
+        }
         /*************************************
          * end of your code
          *************************************/
@@ -226,7 +281,9 @@ void Router(){
     }
 
     // Initialize routing table and control plane buffer
+    // routing table，路由表
     memset(&rt, 0, sizeof(rt));
+    // 控制平面缓冲区
     memset(&cp_buf, 0, sizeof(cp_buf));
     pthread_mutex_init(&cp_buf.lock, NULL);
 
@@ -237,6 +294,7 @@ void Router(){
 
     // Start control plane thread
     pthread_t cp_thread;
+    // control_plane_thread是入口函数，while (1)
     if (pthread_create(&cp_thread, NULL, control_plane_thread, NULL) != 0) {
         fprintf(stderr, "Failed to create control plane thread\n");
         return;
@@ -278,8 +336,25 @@ void Router(){
          * start of your code
          ********************************/
 
-        // Forward packet based on routing table       
-
+        // Forward packet based on routing table 
+        // entry->data 开头是 Ethernet 头，所以 IP 头紧跟在后面
+        ip_header_t *ip = (ip_header_t *)(entry->data + sizeof(eth_header_t));
+        uint32_t dst_ip = ntohl(ip->dst_ip);
+        int forwarded = 0;
+        for (int i = 0; i < rt.count; i++) {
+            if ((dst_ip & rt.entries[i].mask) == rt.entries[i].dest_ip) {
+                for (int j = 0; j < device_count; j++) {
+                    if (strcmp(devices[j].name, rt.entries[i].out_dev) == 0) {
+                    send_packet(&devices[j], entry->data, entry->len);
+                    forwarded = 1;
+                    break;
+                    }
+                }  
+                if (forwarded) {
+                    break;
+                }
+            }
+        }
         /*********************************
          * end of your code
          ********************************/
@@ -327,6 +402,7 @@ int load_rules_from_file(const char *filename) {
 
 void *control_plane_thread(void *arg) {
     (void)arg; // Explicitly mark as unused
+    // 记录上一次广播路由表的时间
     uint64_t last_broadcast = 0;
     
     while (1) {
@@ -340,12 +416,38 @@ void *control_plane_thread(void *arg) {
             /*********************************
             * start of your code
             ********************************/
-
             // Process DV packet and update routing table
-            
+            dv_packet_t *dv = (dv_packet_t *)(entry->data + sizeof(eth_header_t));
+            uint32_t dest_ip = ntohl(dv->dest_ip);
+            uint32_t mask = ntohl(dv->mask);
+            // 经过邻居+1
+            uint32_t distance = ntohl(dv->distance) + 1; 
+
             // Check if destination exists in routing table
-            
+            int found = 0;
+            for (int i = 0; i < rt.count; i++) {
+                if (rt.entries[i].dest_ip == dest_ip &&
+                    rt.entries[i].mask == mask) {
+                    found = 1;
+
+                    // 如果新路径更短，就更新
+                    if (distance < rt.entries[i].distance) {
+                        rt.entries[i].distance = distance;
+                        strncpy(rt.entries[i].out_dev, entry->device->name, 31);
+                        rt.entries[i].out_dev[31] = '\0';
+                    }
+                    break;
+                }
+            }
             // Add new entry if destination not found and table not full
+            if (!found && rt.count < MAX_ROUTES) {
+                rt.entries[rt.count].dest_ip = dest_ip;
+                rt.entries[rt.count].mask = mask;
+                rt.entries[rt.count].distance = distance;
+                strncpy(rt.entries[rt.count].out_dev, entry->device->name, 31);
+                rt.entries[rt.count].out_dev[31] = '\0';
+                rt.count++;
+            }
 
             /*********************************
             * end of your code
@@ -365,11 +467,30 @@ void *control_plane_thread(void *arg) {
         if (now - last_broadcast >= DV_INTERVAL) {
             last_broadcast = now;
 
-            // Iterate through routing table 
-                // Iterate through devices
-                        // Create DV packet (Tips: MAC address can be arbitrary)
-                        // Send DV packet to all devices 
+            // 遍历路由表中的每一项
+            for (int i = 0; i < rt.count; i++) {
+                // 从每个设备广播出去
+                for (int j = 0; j < device_count; j++) {
+                    uint8_t packet[sizeof(eth_header_t) + sizeof(dv_packet_t)];
+                    memset(packet, 0, sizeof(packet));
+                
+                    // eth 指向开头，按 Ethernet 头解释
+                    // dv 指向后半段，按 DV 包解释
+                    eth_header_t *eth = (eth_header_t *)packet;
+                    dv_packet_t *dv = (dv_packet_t *)(packet + sizeof(eth_header_t));
 
+                    // MAC 可以随便填，这里简单写一个广播目的 MAC
+                    memset(eth->dst_mac, 0xff, 6);
+                    memset(eth->src_mac, 0x00, 6);
+                    eth->ether_type = htons(ETH_TYPE_DV);
+
+                    dv->dest_ip = htonl(rt.entries[i].dest_ip);
+                    dv->mask = htonl(rt.entries[i].mask);
+                    dv->distance = htonl(rt.entries[i].distance);
+
+                    send_packet(&devices[j], packet, sizeof(packet));
+                }
+            }
         }
         /*********************************
         * start of your code
