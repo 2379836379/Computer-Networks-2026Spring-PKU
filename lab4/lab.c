@@ -274,6 +274,7 @@ void Switch(){
  ***********************************/
 
 void Router(){
+
     // Initialize common components
     if (common_init() != 0) {
         fprintf(stderr, "Failed to initialize router\n");
@@ -341,6 +342,7 @@ void Router(){
         ip_header_t *ip = (ip_header_t *)(entry->data + sizeof(eth_header_t));
         uint32_t dst_ip = ntohl(ip->dst_ip);
         int forwarded = 0;
+
         for (int i = 0; i < rt.count; i++) {
             if ((dst_ip & rt.entries[i].mask) == rt.entries[i].dest_ip) {
                 for (int j = 0; j < device_count; j++) {
@@ -404,7 +406,7 @@ void *control_plane_thread(void *arg) {
     (void)arg; // Explicitly mark as unused
     // 记录上一次广播路由表的时间
     uint64_t last_broadcast = 0;
-    
+
     while (1) {
         // Process control plane messages
         pthread_mutex_lock(&cp_buf.lock);
@@ -425,6 +427,7 @@ void *control_plane_thread(void *arg) {
 
             // Check if destination exists in routing table
             int found = 0;
+
             for (int i = 0; i < rt.count; i++) {
                 if (rt.entries[i].dest_ip == dest_ip &&
                     rt.entries[i].mask == mask) {
@@ -448,6 +451,7 @@ void *control_plane_thread(void *arg) {
                 rt.entries[rt.count].out_dev[31] = '\0';
                 rt.count++;
             }
+
 
             /*********************************
             * end of your code
