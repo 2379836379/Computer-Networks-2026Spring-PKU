@@ -25,6 +25,22 @@ typedef struct {
     double throughput;
 } connection_t;
 
+static int is_duplicate_connection(const connection_t* connections, int conn_count,
+                                   const connection_t* candidate) {
+    for (int i = 0; i < conn_count; i++) {
+        const connection_t* existing = &connections[i];
+        if (strcmp(existing->local_ip, candidate->local_ip) == 0 &&
+            existing->local_port == candidate->local_port &&
+            strcmp(existing->remote_ip, candidate->remote_ip) == 0 &&
+            existing->remote_port == candidate->remote_port &&
+            strcmp(existing->filename, candidate->filename) == 0 &&
+            existing->file_len == candidate->file_len) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 void* sender_thread(void* arg) {
     connection_t* conn = (connection_t*)arg;
     struct timeval start, end;
@@ -50,11 +66,11 @@ void* receiver_thread(void* arg) {
     struct timeval start, end;
     
     gettimeofday(&start, NULL);
-    size_t received = m_recv(conn->conn_id, conn->buffer, conn->file_len);
+    int received = m_recv(conn->conn_id, conn->buffer, conn->file_len);
     gettimeofday(&end, NULL);
     
-    if (received > 0) {
-        conn->received_len = received;
+    if (received >= 0) {
+        conn->received_len = (size_t)received;
     }
     
     // 返回接收到的数据长度
@@ -91,6 +107,11 @@ int main(int argc, char* argv[]) {
                     conn->remote_ip, &conn->remote_port,
                     conn->filename, &conn->file_len) != 6) {
             fprintf(stderr, "Invalid line format: %s\n", line);
+            continue;
+        }
+
+        if (is_duplicate_connection(connections, conn_count, conn)) {
+            fprintf(stderr, "Skip duplicate connection for %s\n", conn->filename);
             continue;
         }
         
@@ -142,7 +163,7 @@ int main(int argc, char* argv[]) {
         for (int i = 0; i < conn_count; i++) {
             FILE* fp = fopen(connections[i].filename, "wb");
             if (fp) {
-                fwrite(connections[i].buffer, 1, connections[i].file_len, fp);
+                fwrite(connections[i].buffer, 1, connections[i].received_len, fp);
                 fclose(fp);
             }
         }

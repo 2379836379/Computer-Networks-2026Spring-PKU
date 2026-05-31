@@ -24,7 +24,18 @@ arp=(host1 66:77:88:00:00:02 10.0.0.1 \
 connections=(host1 10.0.0.1 10001 host4 10.0.0.4 40001 file1.txt 500000\
     host2 10.0.0.2 20001 host4 10.0.0.4 40002 file2.txt 500000 )
 
+cleanup_veths() {
+    for ((i=0; i<${#links[@]}; i+=6)); do
+        veth1=${links[i+1]}
+        veth2=${links[i+4]}
+        sudo ip link del $veth1 >/dev/null 2>&1 || true
+        sudo ip link del $veth2 >/dev/null 2>&1 || true
+    done
+}
+
 setup() {
+    cleanup_veths
+
     # create and start the nodes
     for node in ${nodes[@]}; do
         echo "Creating and starting $node"
@@ -94,6 +105,10 @@ setup() {
     sudo docker exec device ip link set br0 up
 
     # Generate connection config files
+    for node in host1 host2 host4; do
+        docker exec $node sh -c "rm -f /connections.txt"
+    done
+
     for ((i=0; i<${#connections[@]}; i+=8)); do
         container1=${connections[i]}
         ip1=${connections[i+1]}
@@ -125,6 +140,8 @@ setup() {
 }
 
 clean() {
+    cleanup_veths
+
     # remove all containers
     for node in ${nodes[@]}; do
         echo remove $node
@@ -147,7 +164,5 @@ case "$1" in
         exit 1
         ;;
 esac
-
-
 
 

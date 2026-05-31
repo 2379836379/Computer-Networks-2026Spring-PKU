@@ -1,0 +1,22 @@
+*.o
+*.ipynb_checkpoint
+ipynb_checkpoints/
+__pycache/
+
+# Python 相关
+__pycache__/
+*.py[cod]
+*.pyc
+.ipynb_checkpoints/
+
+# 编译产物
+*.o
+*.exe
+
+# 日志文件
+*.log
+
+# 其他临时文件
+send_email
+net
+device

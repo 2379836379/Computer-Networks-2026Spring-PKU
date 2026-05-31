@@ -7,6 +7,10 @@ SRCS = main.c lab.c
 OBJS = $(SRCS:.c=.o)
 
 .PHONY: all clean
+.PHONY: setup_env setup_topo clean_topo test reset_test_state cleanup_test_state
+
+TARGET_CONTAINERS = host1 host2 host4
+TEST_OUTPUTS = output1.txt output2.txt file1.txt file2.txt
 
 all: $(TARGET)
 
@@ -38,34 +42,29 @@ setup_topo:
 clean_topo:
 	./setup_star.sh clean
 
-test: $(TARGET)
-	# Clean up previous test files
-	rm -f output1.txt output2.txt
-	docker exec host4 rm -f /file1.txt /file2.txt || true
+reset_test_state:
+	rm -f $(TEST_OUTPUTS)
+	docker exec host4 rm -f /file1.txt /file2.txt /log.txt || true
 	docker exec host1 rm -f /log.txt || true
 	docker exec host2 rm -f /log.txt || true
+	docker exec host1 pkill -f /$(TARGET) || true
+	docker exec host2 pkill -f /$(TARGET) || true
+	docker exec host4 pkill -f /$(TARGET) || true
+	docker exec device tc qdisc del dev device-eth3 root >/dev/null 2>&1 || true
 
-	# Copy program to all host containers
-	docker cp $(TARGET) host1:/$(TARGET)
-	docker cp $(TARGET) host2:/$(TARGET)
-	docker cp $(TARGET) host4:/$(TARGET)
-	
-	# Kill any previous instances of the program
-	docker exec -it host1 pkill -f $(TARGET) || true
-	docker exec -it host2 pkill -f $(TARGET) || true
-	docker exec -it host4 pkill -f $(TARGET) || true
+cleanup_test_state:
+	docker exec device tc qdisc del dev device-eth3 root >/dev/null 2>&1 || true
 
-	# set packet loss to be 0.1
-	docker exec -it device tc qdisc add dev device-eth3  root netem loss 10%
-	# cancel packet loss
-	#docker exec -it device tc qdisc del dev device-eth3 root 
-
-	# Run program in host1 and host2 as sender and log output inside container
-	docker exec -dit host1 bash -c "/$(TARGET) sender > /log.txt 2>&1"
-	docker exec -dit host2 bash -c "/$(TARGET) sender > /log.txt 2>&1"
-
-	# Run program in host4 as receiver  
-	docker exec -it host4 /$(TARGET) receiver
+test: $(TARGET) reset_test_state
+	set -e; \
+	trap '$(MAKE) cleanup_test_state' EXIT; \
+	docker cp $(TARGET) host1:/$(TARGET); \
+	docker cp $(TARGET) host2:/$(TARGET); \
+	docker cp $(TARGET) host4:/$(TARGET); \
+	docker exec device tc qdisc add dev device-eth3 root netem loss 10%; \
+	docker exec -dit host1 bash -c "/$(TARGET) sender > /log.txt 2>&1"; \
+	docker exec -dit host2 bash -c "/$(TARGET) sender > /log.txt 2>&1"; \
+	docker exec host4 /$(TARGET) receiver
 
 	# Wait for a few seconds to allow the program to run
 	sleep 1
@@ -98,8 +97,8 @@ test: $(TARGET)
 	@echo "=========================="
 	@echo "Check throughput."
 	@echo "=========================="
-	docker exec -it host1 cat /log.txt | grep "throughput" 
-	docker exec -it host2 cat /log.txt | grep "throughput" 
+	docker exec host1 cat /log.txt | grep "throughput"
+	docker exec host2 cat /log.txt | grep "throughput"
 	
 	
 	
