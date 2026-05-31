@@ -13,10 +13,3 @@ __pycache__/
 *.o
 *.exe
 
-# 日志文件
-*.log
-
-# 其他临时文件
-send_email
-net
-device
