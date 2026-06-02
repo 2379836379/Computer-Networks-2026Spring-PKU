@@ -1,0 +1,2 @@
+[host] host2 rank=1 iface=host2-eth0 ready
+[host] rank1 allreduce done

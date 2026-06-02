@@ -1,86 +1,71 @@
-# Makefile for C project
-CC = gcc
-CFLAGS = -Wall -Wextra
-LDFLAGS = -lpcap
-TARGET = tutorial
-SRCS = main.c 
-OBJS = $(SRCS:.c=.o)
+# 实验七：在网计算  Makefile
+CC      = gcc
+CFLAGS  = -Wall -Wextra -O2
+LDFLAGS = -lpcap -lpthread
+TARGET  = inc
+SRCS    = main.c lab.c
+OBJS    = $(SRCS:.c=.o)
+CFG     = ranks.cfg
+HOSTS   = host1 host2 host3 host4
+N       = 4
 
-.PHONY: all clean
+.PHONY: all clean setup_env setup_topo clean_topo kill \
+        test_route test_transport test_shift test_allreduce test
 
 all: $(TARGET)
 
 $(TARGET): $(OBJS)
-	$(CC) $(CFLAGS)  -o $@ $^ $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-%.o: %.c
+%.o: %.c common.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(OBJS) $(TARGET) *.txt *.log
+	rm -f $(OBJS) $(TARGET) *.log *.nslog output-*.data input-*.data expected-allreduce.data
 
-
-setup_env:	
-	@echo "Setting up node..."
-	apt install libpcap-dev
-	cp daemon.json /etc/docker/daemon.json
-	systemctl daemon-reload
-	systemctl stop docker.service
-	systemctl stop docker.socket
-	systemctl start docker.service
-	systemctl start docker.socket
+#----------------- 环境 / 拓扑 -----------------
+setup_env:
+	apt install -y libpcap-dev
 	docker image build -t node .
-	@echo "Node setup complete."
 
 setup_topo:
-	./setup_topo.sh setup
-
-
-setup_topo2:
-	./setup_topo.sh setup2
-	
+	./setup_star.sh setup
 clean_topo:
-	./setup_topo.sh clean
+	./setup_star.sh clean
 
 kill:
-	# Kill any previous instances of the program
-	docker exec -it switch pkill -f $(TARGET) || true
-	docker exec -it host1 pkill -f $(TARGET) || true
-	docker exec -it host2 pkill -f $(TARGET) || true
+	-@for c in router $(HOSTS); do docker exec $$c pkill -f $(TARGET) 2>/dev/null; done
 
+#----------------- 测试（mode 由 run-test 决定）-----------------
+# 用法： make test_route / test_transport / test_shift / test_allreduce
+# 参数 $(1)=mode  $(2)=每个输入文件的整数个数(nints)
+# 流程：生成输入文件 -> (allreduce 额外生成单机求和参考) -> 运行 -> 文件比对
+define run-test
+	@$(MAKE) -s kill; sleep 1
+	rm -f output-*.data input-*.data expected-allreduce.data *.log
+	bash helper.sh gen $(N) $(2)
+	@if [ "$(1)" = "allreduce" ]; then bash helper.sh sum $(N); fi
+	docker cp $(TARGET) router:/app/$(TARGET)
+	docker exec -dit router bash -c "cd /app; ./$(TARGET) router $(CFG) $(1) > router.log 2>&1"
+	@sleep 1
+	@for c in $(HOSTS); do \
+		docker exec -dit $$c bash -c "cd /app; ./$(TARGET) $$c $(CFG) $(1) > $$c.log 2>&1"; \
+	done
+	@echo "running '$(1)', waiting for hosts to finish ..."
+	@for i in $$(seq 1 90); do \
+		done=1; \
+		for c in $(HOSTS); do docker exec $$c pgrep -f $(TARGET) >/dev/null 2>&1 && done=0; done; \
+		[ $$done -eq 1 ] && break; sleep 1; \
+	done
+	@$(MAKE) -s kill
+	@echo "==================== check ($(1)) ===================="
+	@bash helper.sh check $(1) $(N)
+endef
 
-test: $(TARGET)
-	# Clean up previous test files
-	rm -f *.txt 
-	
-	# Kill any previous instances of the program
-	docker exec -it switch pkill -f $(TARGET) || true
-	docker exec -it host1 pkill -f $(TARGET) || true
-	docker exec -it host2 pkill -f $(TARGET) || true
+test_route:      $(TARGET) ; $(call run-test,route,256)
+test_transport:  $(TARGET) ; $(call run-test,transport,262144)
+test_shift:      $(TARGET) ; $(call run-test,shift,262144)
+test_allreduce:  $(TARGET) ; $(call run-test,allreduce,262144)
 
-	rm -f *.log
-	# start switch 
-	docker exec -dit switch bash -c "cd /app && ./$(TARGET) switch > switch.log 2>&1"
-	# start server (host 2)
-	docker exec -dit host2 bash -c "cd /app && ./$(TARGET) server  > host2.log 2>&1"
-	# sleep for a while
-	sleep 1
-	# start host1, host2
-	docker exec -dit host1 bash -c "cd /app && ./$(TARGET) client  > host1.log 2>&1"
-
-
-test2: $(TARGET)
-	# Clean up previous test files
-	rm -f *.txt 
-	
-	# Kill any previous instances of the program
-	docker exec -it switch pkill -f $(TARGET) || true
-	docker exec -it host1 pkill -f $(TARGET) || true
-	docker exec -it host2 pkill -f $(TARGET) || true
-
-
-	rm -f *.log
-	# start host1, host2	
-	docker exec -dit host2 bash -c "cd /app && ./$(TARGET) server  > host2.log 2>&1"
-	sleep 1
-	docker exec -dit host1 bash -c "cd /app && ./$(TARGET) client  > host1.log 2>&1"
+# 一次跑完四个阶段
+test: test_route test_transport test_shift test_allreduce

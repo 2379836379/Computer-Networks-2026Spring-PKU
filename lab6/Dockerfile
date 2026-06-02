@@ -3,6 +3,7 @@ FROM ubuntu:22.04
 
 # RUN timedatectl set-timezone Asia/Shanghai'
 COPY sources.list /etc/apt/sources.list
+COPY 99clab-noverify /etc/apt/apt.conf.d/99clab-noverify
 RUN apt update 
 
 RUN echo -e "6\n70\n" | apt install tzdata 

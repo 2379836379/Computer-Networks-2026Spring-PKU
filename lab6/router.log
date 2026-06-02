@@ -1,0 +1,2 @@
+[router] opened 4 ports, group_n=4, agtr_slots=64, window=32
+[router] running as INC (forward + aggregate)
