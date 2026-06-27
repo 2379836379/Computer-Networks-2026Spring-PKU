@@ -17,14 +17,39 @@
 
 
 static ccb_table_t conn_table = {0};
+static int conn_table_initialized = 0;
+
+static void ensure_conn_table_initialized(void) {
+    if (conn_table_initialized) {
+        return;
+    }
+
+    for (int i = 0; i < CCB_TABLE_SIZE; i++) {
+        conn_table.entries[i].udp_sock = -1;
+    }
+    conn_table_initialized = 1;
+}
 
 int init_connection(const char* local_ip, uint16_t local_port,
                    const char* remote_ip, uint16_t remote_port) {
+    ensure_conn_table_initialized();
+
     if (conn_table.count >= CCB_TABLE_SIZE) {
         return -1;
     }
 
-    ccb_t* ccb = &conn_table.entries[conn_table.count];
+    int conn_id = -1;
+    for (int i = 0; i < CCB_TABLE_SIZE; i++) {
+        if (conn_table.entries[i].udp_sock < 0) {
+            conn_id = i;
+            break;
+        }
+    }
+    if (conn_id < 0) {
+        return -1;
+    }
+
+    ccb_t* ccb = &conn_table.entries[conn_id];
     memset(ccb, 0, sizeof(ccb_t));
     ccb->udp_sock = -1;
 
@@ -92,20 +117,27 @@ int init_connection(const char* local_ip, uint16_t local_port,
      /***********************
      * end of your code
      **********************/
-    return conn_table.count++;
+    conn_table.count++;
+    return conn_id;
 }
 
 void close_connection(int conn_id) {
-    if (conn_id < 0 || conn_id >= conn_table.count) {
+    ensure_conn_table_initialized();
+
+    if (conn_id < 0 || conn_id >= CCB_TABLE_SIZE) {
         return;
     }
 
     ccb_t* ccb = &conn_table.entries[conn_id];
-    if (ccb->udp_sock >= 0) {
-        close(ccb->udp_sock);
+    if (ccb->udp_sock < 0) {
+        return;
     }
+    close(ccb->udp_sock);
     memset(ccb, 0, sizeof(ccb_t));
     ccb->udp_sock = -1;
+    if (conn_table.count > 0) {
+        conn_table.count--;
+    }
 }
 
 // 更新RTT估计
@@ -186,7 +218,10 @@ static void congestion_control(ccb_t* ccb, int is_timeout) {
 }
 
 int m_send(int conn_id, const void* buf, size_t len) {
-    if (conn_id < 0 || conn_id >= conn_table.count) {
+    ensure_conn_table_initialized();
+
+    if (conn_id < 0 || conn_id >= CCB_TABLE_SIZE ||
+        conn_table.entries[conn_id].udp_sock < 0) {
         return -1;
     }
 
@@ -379,7 +414,7 @@ int m_send(int conn_id, const void* buf, size_t len) {
         }
     }
 
-    return 0;
+    return (int)len;
 }
 
 // 构造ACK分组
@@ -391,7 +426,10 @@ static void build_ack_packet(mtp_header_t* header, uint32_t seq_num) {
 
 int m_recv(int conn_id, void* buf, size_t len) {
     // 连接编号
-    if (conn_id < 0 || conn_id >= conn_table.count) {
+    ensure_conn_table_initialized();
+
+    if (conn_id < 0 || conn_id >= CCB_TABLE_SIZE ||
+        conn_table.entries[conn_id].udp_sock < 0) {
         return -1;
     }
     // 取出这个连接对应的控制块 ccb
