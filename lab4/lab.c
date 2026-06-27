@@ -31,6 +31,7 @@ forwarding_db_t fdb;  // Forwarding database
 #define MAX_ROUTES 32
 #define DV_INTERVAL 1000000  // 1 second
 #define DV_SLEEP 500000      // 0.5 second
+#define PCAP_READ_TIMEOUT_MS 1
 
 /* Routing table */
 typedef struct {
@@ -48,6 +49,8 @@ typedef struct {
 
 routing_table_t rt;  // Routing table
 cp_buffer_t cp_buf;  // Control plane message buffer
+pthread_mutex_t rt_lock = PTHREAD_MUTEX_INITIALIZER;
+extern char device_name[100];
 
 /* Forward declarations */
 void *control_plane_thread(void *arg);
@@ -63,6 +66,20 @@ void print_mac(const uint8_t *mac) {
 }
 void print_ip(uint32_t ip) {
     printf("%u.%u.%u.%u\n", (ip >> 24) & 0xFF, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF);
+}
+
+void format_ip(uint32_t ip, char *buf, size_t len) {
+    snprintf(buf, len, "%u.%u.%u.%u",
+        (ip >> 24) & 0xFF, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF);
+}
+
+static unsigned int mask_to_prefix_len(uint32_t mask) {
+    unsigned int prefix_len = 0;
+    while (mask & 0x80000000u) {
+        prefix_len++;
+        mask <<= 1;
+    }
+    return prefix_len;
 }
 
 
@@ -98,11 +115,16 @@ int common_init(){
             
             // Open device for capture
             devices[device_count].handle = pcap_open_live(d->name,
-                PACKET_BUF_SIZE, 1, 1000, errbuf);
+                PACKET_BUF_SIZE, 1, PCAP_READ_TIMEOUT_MS, errbuf);
             if (!devices[device_count].handle) {
                 fprintf(stderr, "Couldn't open device %s: %s\n",
                     d->name, errbuf);
                 continue;
+            }
+
+            if (pcap_setdirection(devices[device_count].handle, PCAP_D_IN) == -1) {
+                fprintf(stderr, "Warning: couldn't set capture direction on %s: %s\n",
+                    d->name, pcap_geterr(devices[device_count].handle));
             }
 
             // Create capture thread
@@ -213,6 +235,10 @@ void Switch(){
         // 获取 eth->src_mac/eth->dst_mac
         // entry->data 里存的本来就是“抓到的原始以太网帧字节流”，
         // 而以太网帧开头的前 14 字节正好就是 Ethernet header
+        if (entry->len < sizeof(eth_header_t)) {
+            continue;
+        }
+
         eth_header_t *eth = (eth_header_t *)entry->data;
         
         // Learn source MAC address
@@ -287,6 +313,7 @@ void Router(){
     // 控制平面缓冲区
     memset(&cp_buf, 0, sizeof(cp_buf));
     pthread_mutex_init(&cp_buf.lock, NULL);
+    pthread_mutex_init(&rt_lock, NULL);
 
     // Load rules from file if exists
     if (load_rules_from_file("rules.txt") != 0) {
@@ -320,8 +347,15 @@ void Router(){
         pthread_mutex_unlock(&pkt_buffer.lock);
 
         // Check if it's a DV packet
+        if (entry->len < sizeof(eth_header_t)) {
+            continue;
+        }
+
         eth_header_t *eth = (eth_header_t *)entry->data;
         if (ntohs(eth->ether_type) == ETH_TYPE_DV) {
+            if (entry->len < sizeof(eth_header_t) + sizeof(dv_packet_t)) {
+                continue;
+            }
             // Add to control plane buffer
             pthread_mutex_lock(&cp_buf.lock);
             if ((cp_buf.head + 1) % MAX_PACKETS != cp_buf.tail) {
@@ -337,25 +371,49 @@ void Router(){
          * start of your code
          ********************************/
 
-        // Forward packet based on routing table 
-        // entry->data 开头是 Ethernet 头，所以 IP 头紧跟在后面
+        if (ntohs(eth->ether_type) != 0x0800 ||
+            entry->len < sizeof(eth_header_t) + sizeof(ip_header_t)) {
+            continue;
+        }
+
+        // Forward packet based on longest-prefix match.
         ip_header_t *ip = (ip_header_t *)(entry->data + sizeof(eth_header_t));
         uint32_t dst_ip = ntohl(ip->dst_ip);
-        int forwarded = 0;
+        int best_route = -1;
 
+        pthread_mutex_lock(&rt_lock);
         for (int i = 0; i < rt.count; i++) {
-            if ((dst_ip & rt.entries[i].mask) == rt.entries[i].dest_ip) {
-                for (int j = 0; j < device_count; j++) {
-                    if (strcmp(devices[j].name, rt.entries[i].out_dev) == 0) {
+            if ((dst_ip & rt.entries[i].mask) != rt.entries[i].dest_ip) {
+                continue;
+            }
+
+            if (best_route == -1 ||
+                rt.entries[i].mask > rt.entries[best_route].mask ||
+                (rt.entries[i].mask == rt.entries[best_route].mask &&
+                 rt.entries[i].distance < rt.entries[best_route].distance)) {
+                best_route = i;
+            }
+        }
+
+        if (best_route != -1) {
+            char out_dev[32];
+            strncpy(out_dev, rt.entries[best_route].out_dev, sizeof(out_dev) - 1);
+            out_dev[sizeof(out_dev) - 1] = '\0';
+            pthread_mutex_unlock(&rt_lock);
+
+            for (int j = 0; j < device_count; j++) {
+                if (strcmp(devices[j].name, out_dev) == 0) {
                     send_packet(&devices[j], entry->data, entry->len);
-                    forwarded = 1;
-                    break;
-                    }
-                }  
-                if (forwarded) {
                     break;
                 }
             }
+        } else {
+            pthread_mutex_unlock(&rt_lock);
+            char dst_buf[16];
+            format_ip(dst_ip, dst_buf, sizeof(dst_buf));
+            fprintf(stderr, "[%s] drop dst=%s at %llu us\n",
+                device_name, dst_buf,
+                (unsigned long long)get_current_time_us());
         }
         /*********************************
          * end of your code
@@ -387,7 +445,7 @@ int load_rules_from_file(const char *filename) {
                 ip = ntohl(addr.s_addr);
                 
                 // Create mask from prefix length
-                mask = prefix_len ? ~((1 << (32 - prefix_len)) - 1) : 0;
+                mask = prefix_len ? ~((1u << (32 - prefix_len)) - 1u) : 0;
                 
                 // Add to routing table
                 rt.entries[rt.count].dest_ip = ip & mask;
@@ -405,7 +463,7 @@ int load_rules_from_file(const char *filename) {
 void *control_plane_thread(void *arg) {
     (void)arg; // Explicitly mark as unused
     // 记录上一次广播路由表的时间
-    uint64_t last_broadcast = 0;
+    uint64_t last_broadcast = get_current_time_us();
 
     while (1) {
         // Process control plane messages
@@ -414,6 +472,7 @@ void *control_plane_thread(void *arg) {
             packet_entry_t *entry = &cp_buf.packets[cp_buf.tail];
             cp_buf.tail = (cp_buf.tail + 1) % MAX_PACKETS;
             pthread_mutex_unlock(&cp_buf.lock);
+            int route_changed = 0;
             
             /*********************************
             * start of your code
@@ -428,6 +487,7 @@ void *control_plane_thread(void *arg) {
             // Check if destination exists in routing table
             int found = 0;
 
+            pthread_mutex_lock(&rt_lock);
             for (int i = 0; i < rt.count; i++) {
                 if (rt.entries[i].dest_ip == dest_ip &&
                     rt.entries[i].mask == mask) {
@@ -438,6 +498,12 @@ void *control_plane_thread(void *arg) {
                         rt.entries[i].distance = distance;
                         strncpy(rt.entries[i].out_dev, entry->device->name, 31);
                         rt.entries[i].out_dev[31] = '\0';
+                        route_changed = 1;
+                        char dst_buf[16];
+                        format_ip(dest_ip, dst_buf, sizeof(dst_buf));
+                        fprintf(stderr, "[%s] update route %s/%u via %s dist=%u at %llu us\n",
+                            device_name, dst_buf, mask_to_prefix_len(mask), entry->device->name, distance,
+                            (unsigned long long)get_current_time_us());
                     }
                     break;
                 }
@@ -450,12 +516,23 @@ void *control_plane_thread(void *arg) {
                 strncpy(rt.entries[rt.count].out_dev, entry->device->name, 31);
                 rt.entries[rt.count].out_dev[31] = '\0';
                 rt.count++;
+                route_changed = 1;
+                char dst_buf[16];
+                format_ip(dest_ip, dst_buf, sizeof(dst_buf));
+                fprintf(stderr, "[%s] add route %s/%u via %s dist=%u at %llu us\n",
+                    device_name, dst_buf, mask_to_prefix_len(mask), entry->device->name, distance,
+                    (unsigned long long)get_current_time_us());
             }
+            pthread_mutex_unlock(&rt_lock);
 
 
             /*********************************
             * end of your code
             ********************************/
+
+            if (route_changed) {
+                last_broadcast = get_current_time_us();
+            }
 
         } else {
             pthread_mutex_unlock(&cp_buf.lock);
@@ -472,6 +549,7 @@ void *control_plane_thread(void *arg) {
             last_broadcast = now;
 
             // 遍历路由表中的每一项
+            pthread_mutex_lock(&rt_lock);
             for (int i = 0; i < rt.count; i++) {
                 // 从每个设备广播出去
                 for (int j = 0; j < device_count; j++) {
@@ -495,6 +573,7 @@ void *control_plane_thread(void *arg) {
                     send_packet(&devices[j], packet, sizeof(packet));
                 }
             }
+            pthread_mutex_unlock(&rt_lock);
         }
         /*********************************
         * start of your code
@@ -537,9 +616,9 @@ void *capture_thread(void *arg) {
 
         packet_entry_t *entry = &pkt_buffer.packets[pkt_buffer.head];
         entry->device = dev;
-        entry->len = header.len;
+        entry->len = header.len > PACKET_BUF_SIZE ? PACKET_BUF_SIZE : header.len;
         entry->timestamp = header.ts.tv_sec * 1000000 + header.ts.tv_usec;
-        memcpy(entry->data, packet, header.len > PACKET_BUF_SIZE ? PACKET_BUF_SIZE : header.len);
+        memcpy(entry->data, packet, entry->len);
         
         pkt_buffer.head = (pkt_buffer.head + 1) % MAX_PACKETS;
         pthread_mutex_unlock(&pkt_buffer.lock);
@@ -547,4 +626,3 @@ void *capture_thread(void *arg) {
     
     return NULL;
 }
-

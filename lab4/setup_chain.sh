@@ -1,7 +1,11 @@
 #!/bin/bash
 
+set -eu
+
 # the network topology is a chain: host1 <-> device1 <-> device2 <-> device3 <-> device4 <-> host2
 nodes=(host1 device1 device2 device3 device4 host2)
+
+interfaces=(host1-eth0 device1-eth0 device1-eth1 device2-eth0 device2-eth1 device3-eth0 device3-eth1 device4-eth0 device4-eth1 host2-eth0)
 
 links=( host1 host1-eth0 66:77:88:00:01:01 device1 device1-eth0 66:77:88:00:01:02 \
     device1 device1-eth1 66:77:88:00:02:01 device2 device2-eth0 66:77:88:00:02:02 \
@@ -32,6 +36,8 @@ rules=(device1 10.0.1.0/24 device1-eth0 0 \
     device4 10.0.5.0/24 device4-eth1 0 )
 
 setup() {
+    clean
+
     # create and start the nodes
     for node in ${nodes[@]}; do
         echo "Creating and starting $node"
@@ -123,7 +129,12 @@ clean() {
     # remove all containers
     for node in ${nodes[@]}; do
         echo remove $node
-        docker container rm -f $node
+        docker container rm -f $node >/dev/null 2>&1 || true
+    done
+
+    for ifn in ${interfaces[@]}; do
+        echo delete $ifn
+        sudo ip link delete "$ifn" >/dev/null 2>&1 || true
     done
 }
 

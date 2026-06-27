@@ -43,7 +43,7 @@ test_hub:
 	docker exec -dit device bash -c "./$(TARGET) device hub"
 	docker exec -dit host2 bash -c "tcpdump -i host2-eth0 -ne -v > test_hub_host2.log"
 	sleep 1
-	docker exec -it host1 bash -c "ping 10.0.0.4 -c 3 > test_hub_host1.log"
+	docker exec host1 bash -c "ping 10.0.0.4 -c 3 > test_hub_host1.log"
 	docker exec device bash -c "killall $(TARGET)"
 	docker exec host2 bash -c "killall tcpdump"
 	docker cp host2:/test_hub_host2.log .
@@ -63,7 +63,7 @@ test_switch:
 	docker exec -dit device bash -c "./$(TARGET) device switch"
 	docker exec -dit host2 bash -c "tcpdump -i host2-eth0 -ne -v > test_switch_host2.log"
 	sleep 1
-	docker exec -it host1 bash -c "ping 10.0.0.4 -c 3 > test_switch_host1.log"
+	docker exec host1 bash -c "ping 10.0.0.4 -c 3 > test_switch_host1.log"
 	docker exec device bash -c "killall $(TARGET)"
 	docker exec host2 bash -c "killall tcpdump"
 	docker cp host2:/test_switch_host2.log .
@@ -93,7 +93,7 @@ test_router:
 	docker exec -dit device2 bash -c "./$(TARGET) device2 router"
 	docker exec -dit device3 bash -c "./$(TARGET) device3 router"
 	docker exec -dit device4 bash -c "./$(TARGET) device4 router"
-	docker exec -it host1 bash -c "ping 10.0.5.2 -c 5"
+	docker exec host1 bash -c "ping 10.0.5.2 -c 10"
 	sleep 1
 	docker exec device1 bash -c "killall $(TARGET)"
 	docker exec device2 bash -c "killall $(TARGET)"
