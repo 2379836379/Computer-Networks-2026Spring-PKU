@@ -90,19 +90,33 @@ static int build_frame(uint8_t *buf,
 /*======================================================================
  *  主机端
  *====================================================================*/
-
+// 通信组，每个 rank 的静态配置信息，每一项包括：
+//      - rank
+//      - host_name
+//      - host_iface
+//      - router_iface
+//      - host_ip
 static config_entry_t g_cfg[MAX_GROUP_SIZE];
+// 组数
 static int            g_n = 0;
+// 自身的rank
 static int            g_rank = -1;
 static uint32_t       g_my_ip = 0;
-
+// 抓包/发包句柄
 static pcap_t        *g_host_handle = NULL;
 static pthread_mutex_t g_tx_lock = PTHREAD_MUTEX_INITIALIZER;
-
+//当前主机已经初始化的连接”。每个 conn_t 里有：
+//    - in_use：这一项是否有效
+//    - conn_id：连接号
+//    - local_ip / remote_ip：本端和对端 IP
+//    - queue[RXQ_SIZE]：这条连接的接收缓冲区
+//    - head / tail：环形队列读写位置
+//    - lock：保护这条连接队列的锁
 static conn_t         g_conns[MAX_CONNS];
 static int            g_conn_count = 0;
 
 /* 经 pcap 发送一帧（多线程发送加锁）。已给。 */
+// 发到router对端
 static void host_inject(uint8_t *frame, int len) {
     pthread_mutex_lock(&g_tx_lock);
     pcap_inject(g_host_handle, frame, len);
@@ -125,16 +139,18 @@ static void *host_rx_thread(void *arg) {
     struct pcap_pkthdr *hdr;
     const u_char *pkt;
     int rc;
-
+    // 从网卡持续抓包
     while ((rc = pcap_next_ex(g_host_handle, &hdr, &pkt)) >= 0) {
         if (rc == 0) continue;
+        // 过短
         if (hdr->caplen < HDR_LEN) continue;
-
+        // 非ip
         const eth_header_t *eth = (const eth_header_t *)pkt;
         if (ntohs(eth->ether_type) != ETH_TYPE_IP) continue;
-
+        // 非mtp
         const ip_header_t *ip = (const ip_header_t *)(pkt + sizeof(eth_header_t));
         if (ip->protocol != IP_PROTO_MTP) continue;
+        // 自身
         if (ip->src_ip == g_my_ip) continue;
 
         int ip_ihl = (ip->version_ihl & 0x0f) * 4;
@@ -143,15 +159,16 @@ static void *host_rx_thread(void *arg) {
         int plen = ntohs(ip->total_len) - ip_ihl - (int)sizeof(mtp_header_t);
         if (plen < 0) plen = 0;
         if (plen > PAYLOAD_LEN) plen = PAYLOAD_LEN;
-
+        // 查找conn-id
         uint16_t conn_id = ntohs(mtp->conn_id);
         conn_t *cn = NULL;
         for (int i = 0; i < g_conn_count; i++)
             if (g_conns[i].in_use && g_conns[i].conn_id == conn_id) { cn = &g_conns[i]; break; }
         if (!cn) continue;
-
+        // 放进该连接的接收队列
         pthread_mutex_lock(&cn->lock);
         int nh = (cn->head + 1) % RXQ_SIZE;
+        // 如果队列满了丢弃
         if (nh != cn->tail) {
             rx_msg_t *m = &cn->queue[cn->head];
             m->op = mtp->op;
@@ -182,9 +199,10 @@ static int conn_pop(conn_t *cn, rx_msg_t *out) {
 
 /* 已给。 */
 void init_host(config_entry_t *cfgs, int n, const char *host_name) {
+    // 通信组初始化
     g_n = n;
     memcpy(g_cfg, cfgs, sizeof(config_entry_t) * n);
-
+    // 找到自己
     for (int i = 0; i < n; i++)
         if (strcmp(cfgs[i].host_name, host_name) == 0) {
             g_rank = cfgs[i].rank;
@@ -195,19 +213,20 @@ void init_host(config_entry_t *cfgs, int n, const char *host_name) {
         fprintf(stderr, "init_host: host %s not found in config\n", host_name);
         exit(1);
     }
-
+    // 找到本机应该打开的网卡名
     char errbuf[PCAP_ERRBUF_SIZE];
     const char *iface = NULL;
     for (int i = 0; i < n; i++)
         if (cfgs[i].rank == g_rank) iface = cfgs[i].host_iface;
-
+    // 打开网卡
     g_host_handle = pcap_open_live(iface, DEV_BUF_SIZE, 1, 1, errbuf);
     if (!g_host_handle) {
         fprintf(stderr, "pcap_open_live(%s) failed: %s\n", iface, errbuf);
         exit(1);
     }
+    // 只抓入方向数据
     pcap_setdirection(g_host_handle, PCAP_D_IN);
-
+    // 启动后台收包线程
     pthread_t tid;
     pthread_create(&tid, NULL, host_rx_thread, NULL);
     printf("[host] %s rank=%d iface=%s ready\n", host_name, g_rank, iface);
@@ -215,7 +234,9 @@ void init_host(config_entry_t *cfgs, int n, const char *host_name) {
 }
 
 /* 已给。 */
+// 返回连接表的索引
 int init_conn(uint16_t conn_id, uint32_t local_ip, uint32_t remote_ip) {
+    // 检查连接表是否已满
     if (g_conn_count >= MAX_CONNS) return -1;
     conn_t *cn = &g_conns[g_conn_count];
     memset(cn, 0, sizeof(conn_t));
@@ -234,7 +255,7 @@ int init_conn(uint16_t conn_id, uint32_t local_ip, uint32_t remote_ip) {
 int m_send(int conn, const void *buf, uint32_t size, uint8_t op) {
     if (conn < 0 || conn >= g_conn_count) return -1;
     conn_t *cn = &g_conns[conn];
-
+    // 分组
     uint32_t npkts = size / PAYLOAD_LEN;
     if (npkts == 0) return 0;
 
@@ -438,16 +459,18 @@ int allreduce(int group_id, char *src_addr, char *dst_addr, uint32_t size) {
 /*======================================================================
  *  路由器端
  *====================================================================*/
-
+// 端口表
 static net_device_t  g_devs[MAX_GROUP_SIZE];
 static int           g_dev_count = 0;
+// buf
 static dev_buffer_t  g_dev_buf;
-
+// 转发表
 static route_entry_t g_route[MAX_GROUP_SIZE];
 static int           g_route_count = 0;
-
+// 连接表
 static conn_ctx_t    g_conn_ctx[MAX_GROUP_SIZE];
 static int           g_group_n = 0;
+// 聚合器
 static agtr_t       *g_agtr = NULL;
 
 /* 路由器某端口抓包线程（已给） */
@@ -489,6 +512,7 @@ static void router_forward(const uint8_t *frame, int len, uint32_t dst_ip) {
 
 /* 已给。 */
 void init_router(config_entry_t *cfgs, int n) {
+    // 初始化buf
     char errbuf[PCAP_ERRBUF_SIZE];
     memset(&g_dev_buf, 0, sizeof(g_dev_buf));
     pthread_mutex_init(&g_dev_buf.lock, NULL);
@@ -509,17 +533,18 @@ void init_router(config_entry_t *cfgs, int n) {
             continue;
         }
         pcap_setdirection(dev->handle, PCAP_D_IN);
+        // 为每个端口启动一个抓包线程
         pthread_create(&dev->thread_id, NULL, dev_capture_thread, dev);
         g_dev_count++;
     }
-
+    // 构建转发表
     for (int i = 0; i < n; i++) {
         g_route[g_route_count].dst_ip = cfgs[i].host_ip;
         strncpy(g_route[g_route_count].out_port, cfgs[i].router_iface,
                 sizeof(g_route[g_route_count].out_port) - 1);
         g_route_count++;
     }
-
+    //  记录通信组大小
     g_group_n = n;
     for (int k = 0; k < n; k++) {
         g_conn_ctx[k].conn_id = (uint16_t)k;
@@ -527,7 +552,7 @@ void init_router(config_entry_t *cfgs, int n) {
         g_conn_ctx[k].dst_ip  = cfgs[(k + 1) % n].host_ip;
         g_conn_ctx[k].rank    = k;
     }
-
+    // 聚合器
     g_agtr = calloc(AGTR_ARRAY_SIZE, sizeof(agtr_t));   /* calloc 清零，初始各 slot 即干净 */
     if (!g_agtr) { fprintf(stderr, "agtr alloc failed\n"); exit(1); }
     printf("[router] opened %d ports, group_n=%d, agtr_slots=%d, window=%d\n",
